@@ -1,7 +1,0 @@
-[Desktop Entry]
-Type=Service
-ServiceTypes=Krita/PythonPlugin
-X-KDE-Library=krita-displace-filter
-X-Python-2-Compatible=false
-Name=Displace filter
-Comment=Displace your image with displacement map
