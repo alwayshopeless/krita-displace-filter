@@ -1,5 +1,6 @@
 ## What is it?
 A plugin for applying a displacement map to your image.
+
 [Demo: https://www.youtube.com/watch?v=3dQnRbXpVnY](https://youtu.be/d3u7Myc-lk8)
 
 ## Download
@@ -18,5 +19,7 @@ Fast: Click Tools -> Import Plugin from file/Import file from web
 
 Or manually:
 
-Unzip the zip file into the pykrita folder and enable it in Settings -> Configure Krita -> Python Plugin Manager (last in the left list) You can find the pykrita folder in Settings -> Manage Resources -> Open Resources folder(bottom right side of the window)
+Unzip the zip file into the pykrita folder and enable it in Settings -> Configure Krita -> Python Plugin Manager (last in the left list)
+You can find the pykrita folder in Settings -> Manage Resources -> Open Resources folder(bottom right side of the window)
+
 
