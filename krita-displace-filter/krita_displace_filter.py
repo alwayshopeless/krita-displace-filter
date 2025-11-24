@@ -59,58 +59,6 @@ class DisplaceFilterExtension(Extension):
 
         return dn
 
-    def _read_disp_channel_linear_float(self, disp_mv, idx, bpc, settings):
-        """
-        Reads the displacement channel (R, G, B, or Luma) at full resolution
-        and returns its LINEAR float value in the range [0.0, 1.0].
-        This replaces the complex get_normalized_displacement logic.
-        """
-        channel_idx = settings['channel']
-
-        if bpc == 4:
-            # F32 data must be read as float
-            b = struct.unpack('<f', disp_mv[idx : idx + 4])[0]
-            g = struct.unpack('<f', disp_mv[idx + 4 : idx + 8])[0]
-            r = struct.unpack('<f', disp_mv[idx + 8 : idx + 12])[0]
-
-            # Clamp to 0..1 for normalization
-            r = max(0.0, min(1.0, r))
-            g = max(0.0, min(1.0, g))
-            b = max(0.0, min(1.0, b))
-
-        elif bpc == 2:
-            # U16 data (Assumed LINEAR by default in Krita for high bit depth)
-            b = disp_mv[idx] | (disp_mv[idx + 1] << 8)
-            g = disp_mv[idx + 2] | (disp_mv[idx + 3] << 8)
-            r = disp_mv[idx + 4] | (disp_mv[idx + 5] << 8)
-
-            MAX_U16 = 65535.0
-            r /= MAX_U16
-            g /= MAX_U16
-            b /= MAX_U16
-
-        else: # bpc == 1
-            # U8 data (CRITICAL: sRGB -> LINEAR conversion)
-            MAX_U8 = 255.0
-            r_norm = disp_mv[idx + 2] / MAX_U8
-            g_norm = disp_mv[idx + 1] / MAX_U8
-            b_norm = disp_mv[idx] / MAX_U8
-
-            r = self._srgb_to_linear(r_norm)
-            g = self._srgb_to_linear(g_norm)
-            b = self._srgb_to_linear(b_norm)
-
-        # Extract displacement component (R, G, B, or Luma)
-        if channel_idx == 3: # Luminosity (using 0-1 floats)
-            d = 0.299 * r + 0.587 * g + 0.114 * b
-        elif channel_idx == 0: # Red
-            d = r
-        elif channel_idx == 1: # Green
-            d = g
-        else: # Blue
-            d = b
-
-        return d
 
 
     def apply_displace(self):
@@ -141,6 +89,7 @@ class DisplaceFilterExtension(Extension):
 
             doc.setBatchmode(True)
 
+            # Получение данных один раз
             src_data = main_node.pixelData(0, 0, w, h)
             disp_data = disp_node.pixelData(0, 0, w, h)
 
@@ -152,79 +101,153 @@ class DisplaceFilterExtension(Extension):
             src_mv = memoryview(src_data)
             disp_mv = memoryview(disp_data)
 
+            # Проверка BPC
             expected_pixels = w * h * 4
-            if len(src_mv) % expected_pixels != 0:
-                doc.setBatchmode(False)
-                QMessageBox.warning(None, "Error", "Unexpected pixel data size (source).")
-                return
-
             bpc = len(src_mv) // expected_pixels
             if bpc not in (1, 2, 4):
                 doc.setBatchmode(False)
                 QMessageBox.warning(None, "Error", f"Unsupported bytes-per-channel: {bpc}")
                 return
 
+            # -------------------- ПРЕДВАРИТЕЛЬНЫЕ ВЫЧИСЛЕНИЯ --------------------
 
-            strength = settings['strength'] * settings['scale']
+            # Константы для цикла
+            strength_val = settings['strength'] * settings['scale']
             wrap_mode = settings['wrap_mode']
             direction = settings['direction']
             center = settings['center']
             invert = settings['invert']
+            channel_idx = settings['channel']
 
             stride = 4 * bpc
             w_stride = w * stride
+            data_len = len(src_mv)
 
+            MAX_U8 = 255.0
+            MAX_U16 = 65535.0
 
-            out_data = bytearray(len(src_mv))
+            # Предварительно вычислим функции для быстрого доступа
+            srgb_to_linear = self._srgb_to_linear
+            normalize_disp = self._normalize_displacement_float
+
+            # -------------------- СПЕЦИАЛИЗИРОВАННЫЙ ЧИТАТЕЛЬ (Оптимизация 2) --------------------
+
+            # Создаем функцию для чтения, специфичную для BPC, чтобы избежать проверок if/else в цикле
+            if bpc == 1:
+                # U8 Data (sRGB -> Linear)
+                def get_disp_val(idx, disp_mv, channel_idx):
+                    r_norm = disp_mv[idx + 2] / MAX_U8
+                    g_norm = disp_mv[idx + 1] / MAX_U8
+                    b_norm = disp_mv[idx] / MAX_U8
+
+                    # Convert to LINEAR
+                    r = srgb_to_linear(r_norm)
+                    g = srgb_to_linear(g_norm)
+                    b = srgb_to_linear(b_norm)
+
+                    # Extract component
+                    if channel_idx == 3: # Luminosity
+                        return 0.299 * r + 0.587 * g + 0.114 * b
+                    elif channel_idx == 0: # Red
+                        return r
+                    elif channel_idx == 1: # Green
+                        return g
+                    else: # Blue
+                        return b
+
+            elif bpc == 2:
+                # U16 Data (Assumed Linear)
+                def get_disp_val(idx, disp_mv, channel_idx):
+                    # Используем struct.unpack для U16 (6 байт на RGB)
+                    # '<HHH' - B G R
+                    b, g, r = struct.unpack('<HHH', disp_mv[idx : idx + 6])
+
+                    r /= MAX_U16
+                    g /= MAX_U16
+                    b /= MAX_U16
+
+                    if channel_idx == 3: # Luminosity
+                        return 0.299 * r + 0.587 * g + 0.114 * b
+                    elif channel_idx == 0: # Red
+                        return r
+                    elif channel_idx == 1: # Green
+                        return g
+                    else: # Blue
+                        return b
+
+            elif bpc == 4:
+                # F32 Data (Assumed Linear)
+                def get_disp_val(idx, disp_mv, channel_idx):
+                    # Используем struct.unpack для F32 (12 байт на RGB)
+                    # '<fff' - B G R
+                    b, g, r = struct.unpack('<fff', disp_mv[idx : idx + 12])
+
+                    # Clamp to 0..1 for normalization (as in original code)
+                    r = max(0.0, min(1.0, r))
+                    g = max(0.0, min(1.0, g))
+                    b = max(0.0, min(1.0, b))
+
+                    if channel_idx == 3: # Luminosity
+                        return 0.299 * r + 0.587 * g + 0.114 * b
+                    elif channel_idx == 0: # Red
+                        return r
+                    elif channel_idx == 1: # Green
+                        return g
+                    else: # Blue
+                        return b
+            else:
+                 # Должно быть обработано выше, но на всякий случай
+                 return
+
+            out_data = bytearray(data_len)
             out_mv = memoryview(out_data)
 
-            # --- MAIN DISPLACEMENT LOOP (Optimized) ---
+            # --- ГЛАВНЫЙ ЦИКЛ СМЕЩЕНИЯ (Ускоренный) ---
             for y in range(h):
                 row_base = y * w
                 for x in range(w):
                     idx = (row_base + x) * stride
 
-                    # dn is the LINEAR displacement component, normalized to [0.0, 1.0]
-                    dn_linear = self._read_disp_channel_linear_float(disp_mv, idx, bpc, settings)
+                    # 1. Чтение и нормализация смещения (быстрый вызов)
+                    dn_linear = get_disp_val(idx, disp_mv, channel_idx)
+                    dn = normalize_disp(dn_linear, center, invert)
+                    disp_scaled = strength_val * dn
 
-                    dn = self._normalize_displacement_float(dn_linear, center, invert)
-
-                    disp_scaled = strength * dn
-
+                    # 2. Расчет координат
                     if direction == 0:  # Horizontal
-                        sx, sy = x + disp_scaled, y
+                        sx_i = int(round(x + disp_scaled))
+                        sy_i = y
                     elif direction == 1:  # Vertical
-                        sx, sy = x, y + disp_scaled
+                        sx_i = x
+                        sy_i = int(round(y + disp_scaled))
                     else:  # Both
-                        sx, sy = x + disp_scaled, y + disp_scaled
+                        sx_i = int(round(x + disp_scaled))
+                        sy_i = int(round(y + disp_scaled))
 
-                    # 4. Apply Wrap Mode (Inlined apply_wrap_mode)
-                    sx_i = int(round(sx))
-                    sy_i = int(round(sy))
-
-                    if wrap_mode == 1:  # Wrap
+                    # 3. Применение Wrap Mode (более чистый код)
+                    if 0 <= sx_i < w and 0 <= sy_i < h:
+                        # В пределах границ, ничего не делаем (Clamping по умолчанию)
+                        pass
+                    elif wrap_mode == 1:  # Wrap
                         sx_i %= w
                         sy_i %= h
-                    elif wrap_mode == 2:  # Clamp
+                    elif wrap_mode == 2:  # Clamp (только если вышли за границы)
                         sx_i = max(0, min(w - 1, sx_i))
                         sy_i = max(0, min(h - 1, sy_i))
 
-                    # 5. Sample Source Pixel and Write to Output
+                    # 4. Сэмплирование Source Pixel и Запись
                     if 0 <= sx_i < w and 0 <= sy_i < h:
                         src_idx = (sy_i * w + sx_i) * stride
 
-                        # Copy pixel data slice-by-slice for performance
+                        # КОПИРОВАНИЕ ЧЕРЕЗ СЛАЙСЫ memoryview (наиболее быстрое в Python)
                         out_mv[idx : idx + stride] = src_mv[src_idx : src_idx + stride]
                     else:
-                        # Write transparent (optimized by bpc)
-                        if bpc == 1:
-                            out_mv[idx:idx+4] = b'\x00\x00\x00\x00'
-                        elif bpc == 2:
-                            out_mv[idx:idx+8] = b'\x00' * 8
-                        else: # bpc == 4 (F32)
-                            out_mv[idx:idx+16] = struct.pack('<ffff', 0.0, 0.0, 0.0, 0.0) # Explicit float zero
+                        # Запись прозрачного (более чистое и быстрое обнуление)
+                        # Используем memoryview для записи
+                        out_mv[idx : idx + stride] = b'\x00' * stride
 
-            # --- END MAIN DISPLACEMENT LOOP ---
+
+            # --- КОНЕЦ ГЛАВНОГО ЦИКЛА СМЕЩЕНИЯ ---
 
             new_node = main_node.clone()
             layer_name = settings['layer_name'].replace('{layer}', main_node.name())
